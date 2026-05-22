@@ -2,6 +2,8 @@ package storage
 
 import (
 	"context"
+	"fmt"
+	"sync"
 	"testing"
 )
 
@@ -32,6 +34,94 @@ func TestGeoStats_SaveAndGet(t *testing.T) {
 	}
 	if !found {
 		t.Error("DE/malware entry not found in GetGeoStats")
+	}
+}
+
+func TestGeoStats_SaveGeoStats_DistinctUsers(t *testing.T) {
+	s := newTestStorage(t)
+	ctx := context.Background()
+
+	u1 := testUUID("geo-distinct-1")
+	u2 := testUUID("geo-distinct-2")
+	if err := s.SaveGeoStats(ctx, "DE", "Germany", "malware", u1); err != nil {
+		t.Fatalf("SaveGeoStats u1: %v", err)
+	}
+	if err := s.SaveGeoStats(ctx, "DE", "Germany", "malware", u2); err != nil {
+		t.Fatalf("SaveGeoStats u2: %v", err)
+	}
+
+	var matchCount, uniqueUsers int64
+	if err := s.pool.QueryRow(ctx, `
+		SELECT match_count, unique_users FROM threat_geo_stats
+		WHERE country_code = $1 AND threat_type = $2
+	`, "DE", "malware").Scan(&matchCount, &uniqueUsers); err != nil {
+		t.Fatalf("query threat_geo_stats: %v", err)
+	}
+	if matchCount != 2 {
+		t.Errorf("match_count = %d, want 2", matchCount)
+	}
+	if uniqueUsers != 2 {
+		t.Errorf("unique_users = %d, want 2", uniqueUsers)
+	}
+}
+
+func TestGeoStats_SaveGeoStats_SameUserDoesNotInflateUnique(t *testing.T) {
+	s := newTestStorage(t)
+	ctx := context.Background()
+
+	u := testUUID("geo-same-user")
+	for i := 0; i < 3; i++ {
+		if err := s.SaveGeoStats(ctx, "FR", "France", "phishing", u); err != nil {
+			t.Fatalf("SaveGeoStats #%d: %v", i, err)
+		}
+	}
+
+	var matchCount, uniqueUsers int64
+	if err := s.pool.QueryRow(ctx, `
+		SELECT match_count, unique_users FROM threat_geo_stats
+		WHERE country_code = $1 AND threat_type = $2
+	`, "FR", "phishing").Scan(&matchCount, &uniqueUsers); err != nil {
+		t.Fatalf("query threat_geo_stats: %v", err)
+	}
+	if matchCount != 3 {
+		t.Errorf("match_count = %d, want 3", matchCount)
+	}
+	if uniqueUsers != 1 {
+		t.Errorf("unique_users = %d, want 1", uniqueUsers)
+	}
+}
+
+func TestGeoStats_SaveGeoStats_Concurrent(t *testing.T) {
+	s := newTestStorage(t)
+	ctx := context.Background()
+
+	const n = 50
+	var wg sync.WaitGroup
+	wg.Add(n)
+	for i := 0; i < n; i++ {
+		i := i
+		go func() {
+			defer wg.Done()
+			u := testUUID(fmt.Sprintf("geo-conc-%d", i))
+			if err := s.SaveGeoStats(ctx, "JP", "Japan", "tor", u); err != nil {
+				t.Errorf("SaveGeoStats #%d: %v", i, err)
+			}
+		}()
+	}
+	wg.Wait()
+
+	var matchCount, uniqueUsers int64
+	if err := s.pool.QueryRow(ctx, `
+		SELECT match_count, unique_users FROM threat_geo_stats
+		WHERE country_code = $1 AND threat_type = $2
+	`, "JP", "tor").Scan(&matchCount, &uniqueUsers); err != nil {
+		t.Fatalf("query threat_geo_stats: %v", err)
+	}
+	if matchCount != n {
+		t.Errorf("match_count = %d, want %d", matchCount, n)
+	}
+	if uniqueUsers != n {
+		t.Errorf("unique_users = %d, want %d", uniqueUsers, n)
 	}
 }
 

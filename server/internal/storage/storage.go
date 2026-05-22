@@ -46,10 +46,21 @@ func New(ctx context.Context, dsn string) (*Storage, error) {
 	if err != nil {
 		return nil, fmt.Errorf("parse dsn: %w", err)
 	}
-	cfg.MaxConns = 20
-	cfg.MinConns = 2
+	cfg.MaxConns = 40
+	cfg.MinConns = 4
 	cfg.MaxConnIdleTime = 5 * time.Minute
 	cfg.MaxConnLifetime = 30 * time.Minute
+
+	// Cap any single statement at 10s server-side. Without this, a slow
+	// UPSERT under heavy contention (e.g. threat_geo_stats) holds
+	// row-level locks until the client times out and disconnects, which
+	// leaves the lock held until the postmaster reaps the backend.
+	if cfg.ConnConfig.RuntimeParams == nil {
+		cfg.ConnConfig.RuntimeParams = map[string]string{}
+	}
+	if _, set := cfg.ConnConfig.RuntimeParams["statement_timeout"]; !set {
+		cfg.ConnConfig.RuntimeParams["statement_timeout"] = "10000"
+	}
 
 	pool, err := pgxpool.NewWithConfig(ctx, cfg)
 	if err != nil {

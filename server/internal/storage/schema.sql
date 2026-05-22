@@ -292,6 +292,15 @@ CREATE TABLE IF NOT EXISTS threat_geo_stats (
 
 CREATE INDEX IF NOT EXISTS idx_threat_geo_country ON threat_geo_stats(country_code);
 
+-- Tracks distinct users per (country, threat_type) so SaveGeoStats can
+-- increment unique_users in O(1) instead of recounting threat_matches.
+CREATE TABLE IF NOT EXISTS threat_geo_users (
+    country_code text NOT NULL,
+    threat_type  text NOT NULL,
+    user_email   uuid NOT NULL,
+    PRIMARY KEY (country_code, threat_type, user_email)
+);
+
 -- =============================================================================
 -- GeoIP / user locations / IP history
 -- =============================================================================

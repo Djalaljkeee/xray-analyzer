@@ -18,7 +18,34 @@ type Service struct {
 	updateInterval time.Duration
 	stopChan       chan struct{}
 	running        bool
+
+	// geoQueue buffers geo-enrichment jobs from CheckAndRecord. A small
+	// worker pool drains it, replacing the previous "goroutine-per-match"
+	// pattern that flooded the pgx pool under bursty ingest. Buffer is
+	// generous; if full, new jobs are dropped to keep the hot path
+	// non-blocking (geo stats are telemetry, not source of truth).
+	geoQueue chan geoJob
 }
+
+// geoJob is a deferred geo-enrichment request emitted by CheckAndRecord
+// and consumed by geoWorker goroutines.
+type geoJob struct {
+	userEmail  string
+	sourceIP   string
+	threatType string
+	enqueuedAt time.Time
+}
+
+// geoQueueCapacity bounds in-flight geo jobs. Sized to absorb short
+// bursts without blocking the ingest path; jobs older than the worker
+// can drain are dropped at enqueue time.
+const geoQueueCapacity = 4096
+
+// geoWorkerCount is the size of the geo flush worker pool. Each worker
+// pulls one job, performs the (cached) IP lookup, and issues two short
+// pgx writes (SaveGeoStats + SaveUserLocation). Kept small so that
+// pool pressure stays bounded regardless of ingest spikes.
+const geoWorkerCount = 2
 
 // Storage interface for threat intel persistence
 type Storage interface {
@@ -64,6 +91,7 @@ func NewService(storage Storage, ipInfoSvc *ipinfo.Service) *Service {
 		ipInfo:         ipInfoSvc,
 		updateInterval: 3 * time.Hour,
 		stopChan:       make(chan struct{}),
+		geoQueue:       make(chan geoJob, geoQueueCapacity),
 	}
 }
 
@@ -92,6 +120,13 @@ func (s *Service) Start(ctx context.Context) error {
 
 	// Start geo enrichment loop (backfill coordinates for existing records)
 	go s.geoEnrichmentLoop(ctx)
+
+	// Start the geo flush workers. They drain geoQueue serially per
+	// goroutine, so concurrent threat matches no longer spawn one DB
+	// goroutine each.
+	for i := 0; i < geoWorkerCount; i++ {
+		go s.geoWorker(ctx)
+	}
 
 	return nil
 }
@@ -231,23 +266,73 @@ func (s *Service) CheckAndRecord(ctx context.Context, userEmail, nodeID, sourceI
 			log.Printf("threatintel: failed to save match: %v", err)
 		}
 
-		// Save geo stats if IP info service is available
+		// Defer geo enrichment to the worker pool so a flood of threat
+		// matches does not spawn one goroutine each — the previous
+		// pattern saturated the pgx pool and caused tuple lock waits on
+		// threat_geo_stats.
 		if s.ipInfo != nil && sourceIP != "" {
-			go func() {
-				geoCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
-				defer cancel()
-
-				if ipData, err := s.ipInfo.Lookup(geoCtx, sourceIP); err == nil && ipData != nil {
-					// Save geo stats for threat
-					s.storage.SaveGeoStats(geoCtx, ipData.CountryCode, ipData.Country, string(indicator.ThreatType), userEmail)
-					// Save user location with coordinates
-					s.storage.SaveUserLocation(geoCtx, userEmail, ipData.CountryCode, ipData.Country, ipData.City, ipData.Lat, ipData.Lon)
-				}
-			}()
+			s.enqueueGeoJob(geoJob{
+				userEmail:  userEmail,
+				sourceIP:   sourceIP,
+				threatType: string(indicator.ThreatType),
+				enqueuedAt: time.Now(),
+			})
 		}
 	}
 
 	return match
+}
+
+// enqueueGeoJob attempts to push a job onto the geo flush queue.
+// Non-blocking: if the queue is full (workers are behind), the job is
+// dropped. Geo stats are best-effort telemetry, not the source of truth
+// for any blocking flow.
+func (s *Service) enqueueGeoJob(job geoJob) {
+	if s.geoQueue == nil {
+		return
+	}
+	select {
+	case s.geoQueue <- job:
+	default:
+		// Queue saturated — drop silently. Logging here would be noisier
+		// than useful under the bursts this guard is designed to absorb.
+	}
+}
+
+// geoWorker drains geoQueue. Each iteration performs at most one IP
+// lookup and two short pgx writes. ctx is the service's start ctx —
+// when it (or stopChan) closes, the worker exits.
+func (s *Service) geoWorker(ctx context.Context) {
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-s.stopChan:
+			return
+		case job, ok := <-s.geoQueue:
+			if !ok {
+				return
+			}
+			s.processGeoJob(ctx, job)
+		}
+	}
+}
+
+// processGeoJob performs a single deferred geo enrichment. Errors are
+// swallowed — same semantics as the previous fire-and-forget goroutine.
+func (s *Service) processGeoJob(ctx context.Context, job geoJob) {
+	if s.ipInfo == nil || s.storage == nil {
+		return
+	}
+	jobCtx, cancel := context.WithTimeout(ctx, 5*time.Second)
+	defer cancel()
+
+	ipData, err := s.ipInfo.Lookup(jobCtx, job.sourceIP)
+	if err != nil || ipData == nil {
+		return
+	}
+	s.storage.SaveGeoStats(jobCtx, ipData.CountryCode, ipData.Country, job.threatType, job.userEmail)
+	s.storage.SaveUserLocation(jobCtx, job.userEmail, ipData.CountryCode, ipData.Country, ipData.City, ipData.Lat, ipData.Lon)
 }
 
 // GetStats returns threat intelligence statistics
