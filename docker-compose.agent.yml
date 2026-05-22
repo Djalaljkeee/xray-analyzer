@@ -4,7 +4,13 @@ name: log-analyzer
 # Скопируйте на каждую ноду и создайте .env файл с настройками
 
 services:
+  # Default pulls from GitHub Container Registry. Upgrade flow on each node:
+  #   docker compose -f docker-compose.agent.yml pull && \
+  #   docker compose -f docker-compose.agent.yml up -d
+  # Build locally instead:  add --build to the `up` command.
+  # Pin a tag:               ANALYZER_IMAGE_TAG=v1.2.3 in .env
   xray-log-agent:
+    image: ghcr.io/djalaljkeee/xray-analyzer/agent:${ANALYZER_IMAGE_TAG:-latest}
     build:
       context: ./agent
       dockerfile: Dockerfile

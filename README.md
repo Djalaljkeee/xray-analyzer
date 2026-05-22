@@ -127,10 +127,14 @@ Live-метрики, статус системы, аномалии, гео-ка�
 
 ## Quick install — server
 
-Один скрипт устанавливает Postgres + Redis + analyzer-server из исходников. Поддерживает Ubuntu 22.04+/Debian 12+. Подходит для bare-metal, VM, или контейнера с Docker access.
+Один скрипт устанавливает Postgres + Redis + analyzer-server. По умолчанию
+тянет готовый multi-arch образ из GitHub Container Registry
+(`ghcr.io/djalaljkeee/xray-analyzer/server`) — без локальной сборки.
+Поддерживает Ubuntu 22.04+/Debian 12+. Подходит для bare-metal, VM, или
+контейнера с Docker access.
 
 ```bash
-git clone https://github.com/qwertyhq/xray-analyzer.git /opt/xray-analyzer
+git clone https://github.com/Djalaljkeee/xray-analyzer.git /opt/xray-analyzer
 cd /opt/xray-analyzer
 sudo bash scripts/install-server.sh
 ```
@@ -138,9 +142,24 @@ sudo bash scripts/install-server.sh
 После установки скрипт:
 1. Установит Docker + docker-compose-plugin (если нет)
 2. Сгенерирует случайные `API_TOKEN`, `AGENT_TOKEN`, `POSTGRES_PASSWORD` в `.env`
-3. Соберёт images (analyzer-server из локальных Go + Next.js sources)
+3. Подтянет образы из ghcr.io (`docker compose pull`) — или соберёт локально, если выставлен `--build`
 4. Поднимет стек через `docker compose up -d`
 5. Подождёт healthcheck'ов и распечатает endpoints + tokens
+
+**Обновление без потери данных:**
+
+```bash
+cd /opt/xray-analyzer
+docker exec analyzer-postgres pg_dump -U xray_analyzer -Fc xray_analyzer > backups/pg-$(date +%F).dump
+git pull --ff-only
+docker compose pull
+docker compose up -d
+```
+
+Volumes (`analyzer-postgres-data`, `analyzer-data`, `analyzer-redis-data`)
+сохраняются между перезапусками. Миграции БД идемпотентны и применяются
+автоматически. Подробно — в [INSTALL.md → Шаг 7. Обновление без потери
+данных](INSTALL.md#шаг-7-обновление-без-потери-данных).
 
 **Что нужно настроить вручную после установки:**
 
