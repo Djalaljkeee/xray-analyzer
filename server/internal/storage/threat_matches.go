@@ -91,41 +91,41 @@ func (s *Storage) SaveThreatMatch(ctx context.Context, match *threatintel.Threat
 		`, userUUID, string(match.ThreatType), domain, now)
 	}
 
-	// Update hourly stats with proper unique user tracking
+	// Update hourly/daily stats with unique-user tracking. Each pair of
+	// (users-side-table, stats-table) is collapsed into a single CTE: the
+	// side-insert returns a row iff the user is new for that bucket, and
+	// stats.unique_users increments by the side-insert's row count. This
+	// removes the per-match SELECT COUNT(*) from the hot path.
 	hourKey := now.Format("2006-01-02T15")
 	dayKey := now.Format("2006-01-02")
 
-	// Track unique users per hour/threat_type using a separate table
 	s.pool.Exec(ctx, `
-		INSERT INTO threat_hourly_users (hour, threat_type, user_email)
-		VALUES ($1, $2, $3)
-		ON CONFLICT DO NOTHING
+		WITH new_user AS (
+			INSERT INTO threat_hourly_users (hour, threat_type, user_email)
+			VALUES ($1, $2, $3)
+			ON CONFLICT DO NOTHING
+			RETURNING 1
+		)
+		INSERT INTO threat_hourly_stats (hour, threat_type, match_count, unique_users)
+		VALUES ($1, $2, 1, (SELECT COUNT(*) FROM new_user))
+		ON CONFLICT (hour, threat_type) DO UPDATE SET
+			match_count  = threat_hourly_stats.match_count + 1,
+			unique_users = threat_hourly_stats.unique_users + (SELECT COUNT(*) FROM new_user)
 	`, hourKey, string(match.ThreatType), userUUID)
 
-	// Update hourly stats - recalculate unique_users from actual data
 	s.pool.Exec(ctx, `
-		INSERT INTO threat_hourly_stats (hour, threat_type, match_count, unique_users)
-		VALUES ($1, $2, 1, 1)
-		ON CONFLICT (hour, threat_type) DO UPDATE SET
-			match_count = threat_hourly_stats.match_count + 1,
-			unique_users = (SELECT COUNT(*) FROM threat_hourly_users WHERE hour = $3 AND threat_type = $4)
-	`, hourKey, string(match.ThreatType), hourKey, string(match.ThreatType))
-
-	// Track unique users per day/threat_type
-	s.pool.Exec(ctx, `
-		INSERT INTO threat_daily_users (day, threat_type, user_email)
-		VALUES ($1, $2, $3)
-		ON CONFLICT DO NOTHING
-	`, dayKey, string(match.ThreatType), userUUID)
-
-	// Update daily stats - recalculate unique_users from actual data
-	s.pool.Exec(ctx, `
+		WITH new_user AS (
+			INSERT INTO threat_daily_users (day, threat_type, user_email)
+			VALUES ($1, $2, $3)
+			ON CONFLICT DO NOTHING
+			RETURNING 1
+		)
 		INSERT INTO threat_daily_stats (day, threat_type, match_count, unique_users)
-		VALUES ($1, $2, 1, 1)
+		VALUES ($1, $2, 1, (SELECT COUNT(*) FROM new_user))
 		ON CONFLICT (day, threat_type) DO UPDATE SET
-			match_count = threat_daily_stats.match_count + 1,
-			unique_users = (SELECT COUNT(*) FROM threat_daily_users WHERE day = $3 AND threat_type = $4)
-	`, dayKey, string(match.ThreatType), dayKey, string(match.ThreatType))
+			match_count  = threat_daily_stats.match_count + 1,
+			unique_users = threat_daily_stats.unique_users + (SELECT COUNT(*) FROM new_user)
+	`, dayKey, string(match.ThreatType), userUUID)
 
 	// Trim recent records: keep only the most recent MaxThreatMatchesPerUserCategory
 	// in the partition we just inserted into. Scoped to one (user_email, threat_type)
@@ -408,6 +408,7 @@ func (s *Storage) ClearThreatIntelData(ctx context.Context) error {
 		"threat_daily_stats",
 		"threat_daily_users",
 		"threat_geo_stats",
+		"threat_geo_users",
 	}
 
 	for _, table := range tables {

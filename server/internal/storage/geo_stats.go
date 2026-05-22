@@ -8,24 +8,39 @@ import (
 	"github.com/xray-log-analyzer/server/internal/threatintel"
 )
 
-// SaveGeoStats updates geographic statistics for a threat match
+// SaveGeoStats updates geographic statistics for a threat match.
+//
+// Uses a single CTE: an attempted INSERT into the side table
+// threat_geo_users (PK on country_code+threat_type+user_email) flips
+// unique_users by +1 only when a brand-new user is added — without
+// touching threat_matches or user_locations. Replaces the previous
+// implementation that ran a SELECT COUNT(DISTINCT) JOIN under the
+// row-level lock on threat_geo_stats and caused tuple lock waits +
+// statement cancellations under load.
 func (s *Storage) SaveGeoStats(ctx context.Context, countryCode, countryName, threatType, userEmail string) error {
-	if countryCode == "" {
+	if countryCode == "" || userEmail == "" {
 		return nil
 	}
 
-	_, err := s.db.ExecContext(ctx, `
+	userUUID, err := s.ResolveUserEmailToUUID(ctx, userEmail)
+	if err != nil {
+		return fmt.Errorf("resolve user_email: %w", err)
+	}
+
+	_, err = s.pool.Exec(ctx, `
+		WITH new_user AS (
+			INSERT INTO threat_geo_users (country_code, threat_type, user_email)
+			VALUES ($1, $3, $4)
+			ON CONFLICT DO NOTHING
+			RETURNING 1
+		)
 		INSERT INTO threat_geo_stats (country_code, country_name, threat_type, match_count, unique_users, last_match)
-		VALUES ($1, $2, $3, 1, 1, NOW())
+		VALUES ($1, $2, $3, 1, (SELECT COUNT(*) FROM new_user), NOW())
 		ON CONFLICT (country_code, threat_type) DO UPDATE SET
-			match_count = threat_geo_stats.match_count + 1,
-			unique_users = (
-				SELECT COUNT(DISTINCT user_email) FROM threat_matches
-				WHERE threat_type = $4
-				AND source_ip IN (SELECT DISTINCT source_ip FROM user_locations WHERE country_code = $5)
-			),
-			last_match = NOW()
-	`, countryCode, countryName, threatType, threatType, countryCode)
+			match_count  = threat_geo_stats.match_count + 1,
+			unique_users = threat_geo_stats.unique_users + (SELECT COUNT(*) FROM new_user),
+			last_match   = NOW()
+	`, countryCode, countryName, threatType, userUUID)
 
 	return err
 }
