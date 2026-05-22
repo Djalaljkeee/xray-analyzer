@@ -1,10 +1,16 @@
 name: log-analyzer
 
 services:
-  # Main analyzer server with Web UI
+  # Main analyzer server with Web UI.
+  # Default deploy pulls a prebuilt image from GitHub Container Registry
+  # (published by .github/workflows/docker-publish.yml).
+  # Upgrade flow:  docker compose pull && docker compose up -d
+  # Build locally: docker compose up -d --build  (tags the result with the
+  #                same image name, so the next plain `up` keeps using it
+  #                until you re-pull).
+  # Pin a tag:     ANALYZER_IMAGE_TAG=v1.2.3 in .env
   analyzer-server:
-    # Local build (faster). Optional map style URL passed at build time —
-    # defaults to free CARTO dark-matter (no API key required).
+    image: ghcr.io/djalaljkeee/xray-analyzer/server:${ANALYZER_IMAGE_TAG:-latest}
     build:
       context: ./server
       dockerfile: Dockerfile

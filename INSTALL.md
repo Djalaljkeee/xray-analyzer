@@ -490,6 +490,102 @@ docker compose up -d analyzer-server
 - Если IP сервера сменился — обнови DNS A-запись
 - Если **AGENT_TOKEN сменился** — на каждой ноде обновить `/opt/xray-analyzer/.env` и `docker compose -f docker-compose.agent.yml restart`
 
+### Шаг 7. Обновление без потери данных
+
+Все данные (Postgres, agent state, Redis cache) хранятся в **именованных
+Docker volumes** — `analyzer-postgres-data`, `analyzer-data`,
+`analyzer-redis-data`. `docker compose up -d` пересоздаёт **только**
+контейнеры; volumes сохраняются между перезапусками. Миграции схемы
+выполняются автоматически при старте сервера (все `CREATE TABLE IF NOT
+EXISTS` идемпотентны).
+
+#### Вариант А — pull готового образа из ghcr.io (рекомендуется)
+
+С релиза `v1.x` собранные образы публикуются автоматически в
+`ghcr.io/djalaljkeee/xray-analyzer/server` и
+`ghcr.io/djalaljkeee/xray-analyzer/agent` (multi-arch: amd64 + arm64).
+Установка/обновление становится «pull + up» без локальной сборки:
+
+```bash
+cd /opt/xray-analyzer
+
+# 1. Backup БД ПЕРЕД апдейтом — обязательно
+docker exec analyzer-postgres pg_dump -U xray_analyzer -Fc xray_analyzer \
+  > /opt/xray-analyzer/backups/pg-pre-upgrade-$(date +%Y%m%d-%H%M).dump
+
+# 2. Подтяни новый docker-compose.yml (если менялся) и любые правки
+git pull --ff-only
+
+# 3. Скачай свежие образы
+docker compose pull
+
+# 4. Перезапусти на новых образах — данные сохраняются, схема мигрирует автоматически
+docker compose up -d
+
+# 5. Проверь, что всё поднялось и нет ошибок миграции
+docker compose logs --tail=200 analyzer-server | grep -iE "migrate|error|fatal"
+docker compose ps
+```
+
+Пин на конкретную версию (на случай если хочешь откатиться или зафиксировать
+прод-окружение):
+
+```bash
+# В .env
+ANALYZER_IMAGE_TAG=v1.2.3
+```
+
+Откат на предыдущий тег — поменять `ANALYZER_IMAGE_TAG` и `docker compose up -d`.
+
+На каждой **ноде** (агент) — аналогично:
+
+```bash
+cd /opt/xray-analyzer
+docker compose -f docker-compose.agent.yml pull
+docker compose -f docker-compose.agent.yml up -d
+```
+
+#### Вариант Б — локальная сборка из исходников
+
+Если ghcr.io недоступен / нужна правка исходников / арматура paranoid-mode:
+
+```bash
+cd /opt/xray-analyzer
+
+# Backup как в Варианте А, шаг 1
+
+git pull --ff-only
+docker compose build           # пересобирает Go + Next.js
+docker compose up -d
+```
+
+`docker compose build` тегирует результат тем же `image:`-именем, что и
+прод-образ, так что последующий `docker compose up` без `--build` будет
+использовать локально собранную версию до следующего `docker compose pull`.
+
+#### Что НЕ удалять при апгрейде
+
+- ❌ `docker compose down -v` — флаг `-v` сносит **все volumes**, потеряешь Postgres-данные.
+- ❌ `docker volume prune` — то же самое.
+- ✅ `docker compose down` (без `-v`) безопасен: контейнеры удаляются, volumes остаются.
+- ✅ `docker image prune` безопасен: чистит только висячие образы, не volumes.
+
+#### Если миграция сломалась
+
+Сценарий: после `docker compose up -d` сервер крашится с `migrate: ...`.
+
+```bash
+# 1. Останови сервер, чтобы он не писал в БД
+docker compose stop analyzer-server
+
+# 2. Откати образ на предыдущий тег
+echo 'ANALYZER_IMAGE_TAG=v1.X.Y' >> .env   # предыдущий рабочий тег
+docker compose up -d analyzer-server
+
+# 3. Если БД уже частично мигрировалась и старая версия её не понимает —
+#    восстанови из бэкапа (см. «Восстановление из backup» выше).
+```
+
 ---
 
 ## Часть 2 — Агенты на VPN-нодах
