@@ -768,16 +768,26 @@ cd /opt/xray-analyzer
 docker compose up -d analyzer-server
 ```
 
-### Mapbox (geo map в дашборде)
+### Карта (geo map в дашборде)
 
-Получи бесплатный токен: https://account.mapbox.com/access-tokens/
+Карта работает «из коробки» на **MapLibre GL** с открытым стилем
+**CARTO dark-matter** (данные OpenStreetMap, без API-ключа и регистрации).
+
+Если хочешь другой стиль — задай URL совместимого MapLibre/Mapbox-style JSON:
 
 ```bash
-# В .env
-NEXT_PUBLIC_MAPBOX_TOKEN=pk.eyJ1...
+# В .env (опционально)
+NEXT_PUBLIC_MAP_STYLE_URL=https://tiles.openfreemap.org/styles/liberty
 ```
 
-⚠️ Этот токен билдится в JS bundle, **обязательно нужно пересобрать UI**:
+Примеры открытых стилей:
+- `https://basemaps.cartocdn.com/gl/dark-matter-gl-style/style.json` (по умолчанию)
+- `https://basemaps.cartocdn.com/gl/positron-gl-style/style.json` (светлый)
+- `https://basemaps.cartocdn.com/gl/voyager-gl-style/style.json` (цветной)
+- `https://tiles.openfreemap.org/styles/liberty` (OpenFreeMap)
+
+⚠️ Переменная попадает в JS bundle при сборке. Если меняешь стиль —
+**нужно пересобрать UI**:
 
 ```bash
 docker compose build analyzer-server

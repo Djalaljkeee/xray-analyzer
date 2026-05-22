@@ -174,8 +174,9 @@ BLACKLIST_RELOAD=5m
 # Aleria AI assistant (опционально)
 ALERIA_API_KEY=
 
-# Mapbox для UI geo map (опционально)
-NEXT_PUBLIC_MAPBOX_TOKEN=
+# Карта в UI работает «из коробки» (MapLibre GL + CARTO dark-matter).
+# Опционально — свой стиль карты (любой совместимый MapLibre style JSON).
+NEXT_PUBLIC_MAP_STYLE_URL=
 EOF
 
     chmod 600 "$ENV_FILE"

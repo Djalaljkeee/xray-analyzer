@@ -3,12 +3,13 @@ name: log-analyzer
 services:
   # Main analyzer server with Web UI
   analyzer-server:
-    # Local build (faster, uses local .env for MAPBOX_TOKEN)
+    # Local build (faster). Optional map style URL passed at build time —
+    # defaults to free CARTO dark-matter (no API key required).
     build:
       context: ./server
       dockerfile: Dockerfile
       args:
-        - NEXT_PUBLIC_MAPBOX_TOKEN=${NEXT_PUBLIC_MAPBOX_TOKEN:-}
+        - NEXT_PUBLIC_MAP_STYLE_URL=${NEXT_PUBLIC_MAP_STYLE_URL:-}
     container_name: xray-log-analyzer
     restart: unless-stopped
     ports:

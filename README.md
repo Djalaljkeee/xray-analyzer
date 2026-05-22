@@ -262,8 +262,9 @@ OPENAI_API_KEY=<key>
 OPENAI_BASE_URL=https://api.openai.com/v1
 OPENAI_MODEL=gpt-4o-mini
 
-# Web UI Mapbox token для geo map (опционально)
-NEXT_PUBLIC_MAPBOX_TOKEN=<token>
+# Web UI: альтернативный стиль карты (опционально)
+# По умолчанию используется MapLibre GL + CARTO dark-matter — без API-ключа.
+NEXT_PUBLIC_MAP_STYLE_URL=
 ```
 
 ### Agent (.env)

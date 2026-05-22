@@ -31,9 +31,10 @@ RUN npm ci
 # Copy source
 COPY web/ ./
 
-# Build args for NEXT_PUBLIC variables
-ARG NEXT_PUBLIC_MAPBOX_TOKEN
-ENV NEXT_PUBLIC_MAPBOX_TOKEN=${NEXT_PUBLIC_MAPBOX_TOKEN}
+# Build args for NEXT_PUBLIC variables. Map style is optional — the
+# component falls back to the free CARTO dark-matter style when unset.
+ARG NEXT_PUBLIC_MAP_STYLE_URL
+ENV NEXT_PUBLIC_MAP_STYLE_URL=${NEXT_PUBLIC_MAP_STYLE_URL}
 
 # Set API URL for build
 ENV NEXT_PUBLIC_API_URL=""

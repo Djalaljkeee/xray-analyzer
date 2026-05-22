@@ -1,16 +1,20 @@
 "use client";
 
 import { useMemo, useState, useCallback, useRef, useEffect } from "react";
-import Map, { Source, Layer, Popup } from "react-map-gl/mapbox";
-import type { MapRef } from "react-map-gl/mapbox";
+import Map, { Source, Layer, Popup, AttributionControl } from "react-map-gl/maplibre";
+import type { MapRef, MapLayerMouseEvent } from "react-map-gl/maplibre";
 import type { FeatureCollection, Point } from "geojson";
-import type { LayerProps } from "react-map-gl/mapbox";
-import type mapboxgl from "mapbox-gl";
+import type { LayerProps } from "react-map-gl/maplibre";
 import { Card, CardContent, CardHeader, CardTitle, CardDescription } from "@/components/ui/card";
 import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
-import { Globe, Maximize2, Minimize2, X } from "lucide-react";
-import "mapbox-gl/dist/mapbox-gl.css";
+import { Globe, Maximize2, X } from "lucide-react";
+import "maplibre-gl/dist/maplibre-gl.css";
+
+// Default basemap: CARTO dark-matter (OpenStreetMap data, freely available
+// vector style, no API key). Override via NEXT_PUBLIC_MAP_STYLE_URL.
+const DEFAULT_MAP_STYLE = "https://basemaps.cartocdn.com/gl/dark-matter-gl-style/style.json";
+const MAP_STYLE_URL = process.env.NEXT_PUBLIC_MAP_STYLE_URL || DEFAULT_MAP_STYLE;
 
 // Country centroids for geo positioning
 const countryCentroids: Record<string, [number, number]> = {
@@ -112,8 +116,6 @@ function getFlag(countryCode: string): string {
   return String.fromCodePoint(...codePoints);
 }
 
-const MAPBOX_TOKEN = process.env.NEXT_PUBLIC_MAPBOX_TOKEN;
-
 export function GeoMap({ data, cityData = [], title = "Geographic Distribution", mode = "cities" }: GeoMapProps) {
   const mapRef = useRef<MapRef>(null);
   const [isFullscreen, setIsFullscreen] = useState(false);
@@ -197,7 +199,7 @@ export function GeoMap({ data, cityData = [], title = "Geographic Distribution",
 
   // Choose which data to display based on mode
   const geojson = mode === "cities" && cityData.length > 0 ? cityGeojson : countryGeojson;
-  const displayData = useMemo(() => 
+  const displayData = useMemo(() =>
     mode === "cities" && cityData.length > 0 ? cityData : data,
     [mode, cityData, data]
   );
@@ -232,7 +234,7 @@ export function GeoMap({ data, cityData = [], title = "Geographic Distribution",
     },
   }), [maxCount]);
 
-  const onClick = useCallback((event: mapboxgl.MapLayerMouseEvent) => {
+  const onClick = useCallback((event: MapLayerMouseEvent) => {
     const feature = event.features?.[0];
     if (feature && feature.geometry.type === "Point") {
       const coords = feature.geometry.coordinates as [number, number];
@@ -259,26 +261,6 @@ export function GeoMap({ data, cityData = [], title = "Geographic Distribution",
       mapRef.current.getCanvas().style.cursor = "";
     }
   }, []);
-
-  if (!MAPBOX_TOKEN) {
-    return (
-      <Card>
-        <CardHeader className="pb-3">
-          <CardTitle className="text-sm font-medium flex items-center gap-2">
-            <Globe className="h-4 w-4 text-blue-500" />
-            {title}
-          </CardTitle>
-        </CardHeader>
-        <CardContent>
-          <div className="text-center py-6 text-muted-foreground">
-            <Globe className="h-8 w-8 mx-auto mb-2 opacity-30" />
-            <p className="text-sm">Mapbox API key not configured</p>
-            <p className="text-xs mt-1">Set NEXT_PUBLIC_MAPBOX_TOKEN in environment</p>
-          </div>
-        </CardContent>
-      </Card>
-    );
-  }
 
   if (data.length === 0) {
     return (
@@ -309,7 +291,7 @@ export function GeoMap({ data, cityData = [], title = "Geographic Distribution",
               <Globe className="h-5 w-5 text-blue-500" />
               <span className="font-medium">{title}</span>
               <span className="text-muted-foreground text-sm">
-                {mode === "cities" && cityData.length > 0 
+                {mode === "cities" && cityData.length > 0
                   ? `${cityData.length} cities • ${totalCount.toLocaleString()} connections`
                   : `${data.length} countries • ${totalCount.toLocaleString()} connections`
                 }
@@ -326,20 +308,20 @@ export function GeoMap({ data, cityData = [], title = "Geographic Distribution",
           </Button>
           <Map
             ref={mapRef}
-            mapboxAccessToken={MAPBOX_TOKEN}
             initialViewState={{
               longitude: 40,
               latitude: 40,
               zoom: 2.5,
             }}
             style={{ width: "100%", height: "100%" }}
-            mapStyle="mapbox://styles/mapbox/dark-v11"
+            mapStyle={MAP_STYLE_URL}
             interactiveLayerIds={["geo-points"]}
             onClick={onClick}
             onMouseEnter={onMouseEnter}
             onMouseLeave={onMouseLeave}
             attributionControl={false}
           >
+            <AttributionControl compact customAttribution='© <a href="https://www.openstreetmap.org/copyright">OpenStreetMap</a> contributors © <a href="https://carto.com/attributions">CARTO</a>' />
             <Source id="geo-data" type="geojson" data={geojson}>
               <Layer {...layerStyle} />
             </Source>
@@ -449,7 +431,7 @@ export function GeoMap({ data, cityData = [], title = "Geographic Distribution",
             </Button>
           </div>
           <CardDescription className="text-xs">
-            {mode === "cities" && cityData.length > 0 
+            {mode === "cities" && cityData.length > 0
               ? `${cityData.length} cities • ${totalCount.toLocaleString()} connections`
               : `${data.length} countries • ${totalCount.toLocaleString()} connections`
             }
@@ -459,20 +441,20 @@ export function GeoMap({ data, cityData = [], title = "Geographic Distribution",
           <div className="h-[300px] relative">
             <Map
               ref={isFullscreen ? undefined : mapRef}
-              mapboxAccessToken={MAPBOX_TOKEN}
               initialViewState={{
                 longitude: 40,
                 latitude: 40,
                 zoom: 1.5,
               }}
               style={{ width: "100%", height: "100%" }}
-              mapStyle="mapbox://styles/mapbox/dark-v11"
+              mapStyle={MAP_STYLE_URL}
               interactiveLayerIds={["geo-points"]}
               onClick={onClick}
               onMouseEnter={onMouseEnter}
               onMouseLeave={onMouseLeave}
               attributionControl={false}
             >
+              <AttributionControl compact customAttribution='© <a href="https://www.openstreetmap.org/copyright">OpenStreetMap</a> contributors © <a href="https://carto.com/attributions">CARTO</a>' />
               <Source id="geo-data" type="geojson" data={geojson}>
                 <Layer {...layerStyle} />
               </Source>
