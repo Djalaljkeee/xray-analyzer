@@ -111,14 +111,16 @@ const resolveUserEmailQueryText = `
 // resolveUserEmailQueryNumeric matches numeric-looking inputs against id,
 // us_id, username, and email in a single planner-visible query so the
 // engine can pick the best index branch instead of forcing 3 round-trips.
+// Each branch is parenthesized — Postgres rejects a bare LIMIT on a UNION
+// branch without parens.
 const resolveUserEmailQueryNumeric = `
-	SELECT uuid::text FROM remna_users WHERE id = $1::bigint LIMIT 1
+	(SELECT uuid::text FROM remna_users WHERE id = $1::bigint LIMIT 1)
 	UNION ALL
-	SELECT uuid::text FROM remna_users WHERE us_id = $1     LIMIT 1
+	(SELECT uuid::text FROM remna_users WHERE us_id = $1     LIMIT 1)
 	UNION ALL
-	SELECT uuid::text FROM remna_users WHERE username = $1  LIMIT 1
+	(SELECT uuid::text FROM remna_users WHERE username = $1  LIMIT 1)
 	UNION ALL
-	SELECT uuid::text FROM remna_users WHERE email = $1     LIMIT 1
+	(SELECT uuid::text FROM remna_users WHERE email = $1     LIMIT 1)
 	LIMIT 1
 `
 
