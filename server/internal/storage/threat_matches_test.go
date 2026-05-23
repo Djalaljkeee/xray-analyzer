@@ -275,7 +275,7 @@ func TestGetThreatMatches_Empty(t *testing.T) {
 	}
 }
 
-func TestSaveThreatMatch_PerUserCategoryTrim(t *testing.T) {
+func TestTrimThreatMatchesPerUserCategory(t *testing.T) {
 	s := newTestStorage(t)
 	ctx := context.Background()
 
@@ -286,6 +286,11 @@ func TestSaveThreatMatch_PerUserCategoryTrim(t *testing.T) {
 		if err := s.SaveThreatMatch(ctx, newThreatMatch(trimUUID, "social")); err != nil {
 			t.Fatalf("SaveThreatMatch #%d: %v", i, err)
 		}
+	}
+
+	// Trim runs out-of-band (background cleanup) instead of per-save.
+	if _, err := s.TrimThreatMatchesPerUserCategory(ctx); err != nil {
+		t.Fatalf("TrimThreatMatchesPerUserCategory: %v", err)
 	}
 
 	// Count remaining rows for this (user, type) pair

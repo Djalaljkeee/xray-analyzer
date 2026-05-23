@@ -7,6 +7,7 @@ import (
 	"time"
 
 	"github.com/google/uuid"
+	"github.com/jackc/pgx/v5"
 	"github.com/xray-log-analyzer/server/internal/models"
 	"github.com/xray-log-analyzer/server/internal/threatintel"
 )
@@ -42,64 +43,60 @@ func (s *Storage) SaveThreatMatch(ctx context.Context, match *threatintel.Threat
 		return fmt.Errorf("resolve node_id: %w", err)
 	}
 
-	// Insert into recent matches table
-	_, err = s.pool.Exec(ctx, `
+	domain := extractDomain(match.Destination)
+	hourKey := now.Format("2006-01-02T15")
+	dayKey := now.Format("2006-01-02")
+	threatType := string(match.ThreatType)
+
+	// Pipeline all per-event writes in a single pgx.Batch round-trip
+	// instead of 7 sequential Execs. The original code took ~7 RTTs per
+	// threat hit; this brings it down to one. The DELETE … NOT IN trim
+	// step is removed entirely — partition retention already drops old
+	// data, and the trim was running an unbounded subquery on every save.
+	batch := &pgx.Batch{}
+	batch.Queue(`
 		INSERT INTO threat_matches (
 			user_email, node_id, source_ip, destination,
 			threat_type, source, confidence, description, matched_at, ts
 		) VALUES ($1, $2, $3::inet, $4, $5, $6, $7, $8, $9, $10)
 	`, userUUID, int16(nodeID), match.SourceIP, match.Destination,
-		string(match.ThreatType), string(match.Source), match.Confidence,
+		threatType, string(match.Source), match.Confidence,
 		match.Description, now, now)
 
-	if err != nil {
-		return err
-	}
-
-	// Update aggregated total counter
-	s.pool.Exec(ctx, `
+	batch.Queue(`
 		UPDATE threat_stats_agg SET total_matches = total_matches + 1, last_updated = $1 WHERE id = 1
 	`, now)
 
-	// Update threat type counter
-	s.pool.Exec(ctx, `
+	batch.Queue(`
 		INSERT INTO threat_type_stats (threat_type, match_count, last_match)
 		VALUES ($1, 1, $2)
 		ON CONFLICT (threat_type) DO UPDATE SET
 			match_count = threat_type_stats.match_count + 1,
 			last_match = EXCLUDED.last_match
-	`, string(match.ThreatType), now)
+	`, threatType, now)
 
-	// Update user threat stats
-	s.pool.Exec(ctx, `
+	batch.Queue(`
 		INSERT INTO user_threat_stats (user_email, threat_type, match_count, last_match)
 		VALUES ($1, $2, 1, $3)
 		ON CONFLICT (user_email, threat_type) DO UPDATE SET
 			match_count = user_threat_stats.match_count + 1,
 			last_match = EXCLUDED.last_match
-	`, userUUID, string(match.ThreatType), now)
+	`, userUUID, threatType, now)
 
-	// Update user domain stats (extract domain from destination)
-	domain := extractDomain(match.Destination)
 	if domain != "" {
-		s.pool.Exec(ctx, `
+		batch.Queue(`
 			INSERT INTO user_threat_domains (user_email, threat_type, domain, hit_count, last_seen)
 			VALUES ($1, $2, $3, 1, $4)
 			ON CONFLICT (user_email, threat_type, domain) DO UPDATE SET
 				hit_count = user_threat_domains.hit_count + 1,
 				last_seen = EXCLUDED.last_seen
-		`, userUUID, string(match.ThreatType), domain, now)
+		`, userUUID, threatType, domain, now)
 	}
 
-	// Update hourly/daily stats with unique-user tracking. Each pair of
-	// (users-side-table, stats-table) is collapsed into a single CTE: the
-	// side-insert returns a row iff the user is new for that bucket, and
-	// stats.unique_users increments by the side-insert's row count. This
-	// removes the per-match SELECT COUNT(*) from the hot path.
-	hourKey := now.Format("2006-01-02T15")
-	dayKey := now.Format("2006-01-02")
-
-	s.pool.Exec(ctx, `
+	// Hourly/daily counters with unique-user tracking. Each CTE inserts a
+	// row into the side-users table iff the user is new for that bucket
+	// and increments unique_users by that insert's row count.
+	batch.Queue(`
 		WITH new_user AS (
 			INSERT INTO threat_hourly_users (hour, threat_type, user_email)
 			VALUES ($1, $2, $3)
@@ -111,9 +108,9 @@ func (s *Storage) SaveThreatMatch(ctx context.Context, match *threatintel.Threat
 		ON CONFLICT (hour, threat_type) DO UPDATE SET
 			match_count  = threat_hourly_stats.match_count + 1,
 			unique_users = threat_hourly_stats.unique_users + (SELECT COUNT(*) FROM new_user)
-	`, hourKey, string(match.ThreatType), userUUID)
+	`, hourKey, threatType, userUUID)
 
-	s.pool.Exec(ctx, `
+	batch.Queue(`
 		WITH new_user AS (
 			INSERT INTO threat_daily_users (day, threat_type, user_email)
 			VALUES ($1, $2, $3)
@@ -125,24 +122,19 @@ func (s *Storage) SaveThreatMatch(ctx context.Context, match *threatintel.Threat
 		ON CONFLICT (day, threat_type) DO UPDATE SET
 			match_count  = threat_daily_stats.match_count + 1,
 			unique_users = threat_daily_stats.unique_users + (SELECT COUNT(*) FROM new_user)
-	`, dayKey, string(match.ThreatType), userUUID)
+	`, dayKey, threatType, userUUID)
 
-	// Trim recent records: keep only the most recent MaxThreatMatchesPerUserCategory
-	// in the partition we just inserted into. Scoped to one (user_email, threat_type)
-	// pair so the DELETE is bounded — it walks idx_threat_user_type_time and deletes
-	// at most one row per save instead of scanning the whole table.
-	_, err = s.pool.Exec(ctx, `
-		DELETE FROM threat_matches
-		WHERE user_email = $1 AND threat_type = $2
-		  AND id NOT IN (
-			SELECT id FROM threat_matches
-			WHERE user_email = $1 AND threat_type = $2
-			ORDER BY matched_at DESC
-			LIMIT $3
-		)
-	`, userUUID, string(match.ThreatType), MaxThreatMatchesPerUserCategory)
-
-	return err
+	br := s.pool.SendBatch(ctx, batch)
+	defer br.Close()
+	// Surface the INSERT result so callers see real errors; remaining
+	// queries are best-effort counters and their errors are tolerated.
+	if _, err := br.Exec(); err != nil {
+		return err
+	}
+	for i := 1; i < batch.Len(); i++ {
+		_, _ = br.Exec()
+	}
+	return nil
 }
 
 // extractDomain extracts domain from destination (removes port)
@@ -359,6 +351,28 @@ func (s *Storage) CleanupOldThreatMatches(ctx context.Context, retention time.Du
 	}
 
 	return result.RowsAffected(), nil
+}
+
+// TrimThreatMatchesPerUserCategory enforces MaxThreatMatchesPerUserCategory
+// across every (user_email, threat_type) pair, deleting all but the most
+// recent matches for each. Previously this ran inside SaveThreatMatch on
+// the per-event hot path with an unbounded NOT-IN subquery — moved here
+// so it runs once per background-cleanup tick instead of per-match.
+func (s *Storage) TrimThreatMatchesPerUserCategory(ctx context.Context) (int64, error) {
+	res, err := s.pool.Exec(ctx, `
+		WITH ranked AS (
+			SELECT id, ts,
+			       ROW_NUMBER() OVER (PARTITION BY user_email, threat_type ORDER BY matched_at DESC) AS rn
+			FROM threat_matches
+		)
+		DELETE FROM threat_matches t
+		USING ranked
+		WHERE ranked.id = t.id AND ranked.ts = t.ts AND ranked.rn > $1
+	`, MaxThreatMatchesPerUserCategory)
+	if err != nil {
+		return 0, err
+	}
+	return res.RowsAffected(), nil
 }
 
 // scanThreatMatchesWithDisplayName is a helper to scan threat match rows with display_name

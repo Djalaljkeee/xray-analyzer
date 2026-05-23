@@ -3,6 +3,7 @@ package storage
 import (
 	"context"
 	"fmt"
+	"strings"
 	"time"
 
 	"github.com/google/uuid"
@@ -26,7 +27,6 @@ func (s *Storage) buildDestSearchUUIDs(ctx context.Context, userEmail string) []
 	}
 	return uuids
 }
-
 
 // RecordUserDestination records or updates a user's destination visit.
 // userEmail must be a valid UUID string (Remnawave user UUID).
@@ -54,6 +54,58 @@ func (s *Storage) RecordUserDestination(ctx context.Context, userEmail, nodeID, 
 			last_seen = EXCLUDED.last_seen
 	`, userUUID, int16(nid), destination, now, now)
 
+	return err
+}
+
+// UserDestKey identifies a row to upsert in BulkRecordUserDestinations.
+type UserDestKey struct {
+	UserEmail   string
+	Destination string
+}
+
+// BulkRecordUserDestinations performs one UPSERT per distinct
+// (user_email, destination) using INSERT … VALUES (...), (...), ...
+// instead of one round-trip per row. The analyzer typically sees the
+// same destinations many times per batch — pre-dedup keeps the payload
+// small and forwards the request_count delta as a single increment.
+//
+// All entries must share the same nodeID. entries maps (user, dest) to
+// the count for that pair within the batch.
+func (s *Storage) BulkRecordUserDestinations(ctx context.Context, nodeID string, entries map[UserDestKey]int) error {
+	if len(entries) == 0 {
+		return nil
+	}
+	nid, err := s.LookupNodeID(ctx, nodeID, "exit")
+	if err != nil {
+		return fmt.Errorf("resolve node_id: %w", err)
+	}
+	now := time.Now().UTC()
+
+	args := make([]any, 0, len(entries)*5)
+	values := make([]string, 0, len(entries))
+	i := 1
+	for k, cnt := range entries {
+		userUUID, err := s.ResolveUserEmailToUUID(ctx, k.UserEmail)
+		if err != nil {
+			continue
+		}
+		values = append(values, fmt.Sprintf("($%d, $%d, $%d, $%d, $%d, $%d)",
+			i, i+1, i+2, i+3, i+4, i+5))
+		args = append(args, userUUID, int16(nid), k.Destination, cnt, now, now)
+		i += 6
+	}
+	if len(values) == 0 {
+		return nil
+	}
+
+	query := `
+		INSERT INTO user_destinations (user_email, node_id, destination, request_count, first_seen, last_seen)
+		VALUES ` + strings.Join(values, ", ") + `
+		ON CONFLICT (user_email, node_id, destination) DO UPDATE SET
+			request_count = user_destinations.request_count + EXCLUDED.request_count,
+			last_seen     = EXCLUDED.last_seen
+	`
+	_, err = s.pool.Exec(ctx, query, args...)
 	return err
 }
 

@@ -90,12 +90,34 @@ func (s *Storage) GetTopUsersByCategory(ctx context.Context, category string, li
 		return cached.([]*threatintel.CategoryUserStats), nil
 	}
 
+	// Single query: top-N users for the category + their top-5 domains
+	// joined via LATERAL. The old version fired N+1 queries (one per
+	// returned user) to populate Domains.
 	rows, err := s.pool.Query(ctx, `
-		SELECT user_email::text, threat_type, match_count
-		FROM user_threat_stats
-		WHERE threat_type = $1
-		ORDER BY match_count DESC
-		LIMIT $2
+		WITH top_users AS (
+			SELECT user_email, match_count
+			FROM user_threat_stats
+			WHERE threat_type = $1
+			ORDER BY match_count DESC
+			LIMIT $2
+		)
+		SELECT
+			tu.user_email::text,
+			$1::text AS threat_type,
+			tu.match_count,
+			COALESCE(td.top_domains, '{}'::text[]) AS top_domains
+		FROM top_users tu
+		LEFT JOIN LATERAL (
+			SELECT array_agg(domain ORDER BY hit_count DESC) AS top_domains
+			FROM (
+				SELECT domain, hit_count
+				FROM user_threat_domains
+				WHERE user_email = tu.user_email AND threat_type = $1
+				ORDER BY hit_count DESC
+				LIMIT 5
+			) sub
+		) td ON true
+		ORDER BY tu.match_count DESC
 	`, category, limit)
 	if err != nil {
 		return nil, err
@@ -105,54 +127,83 @@ func (s *Storage) GetTopUsersByCategory(ctx context.Context, category string, li
 	var stats []*threatintel.CategoryUserStats
 	for rows.Next() {
 		var st threatintel.CategoryUserStats
-		if err := rows.Scan(&st.UserEmail, &st.Category, &st.MatchCount); err != nil {
+		var domains []string
+		if err := rows.Scan(&st.UserEmail, &st.Category, &st.MatchCount, &domains); err != nil {
 			return nil, err
 		}
+		st.Domains = domains
 		stats = append(stats, &st)
 	}
 	if err := rows.Err(); err != nil {
 		return nil, err
 	}
 
-	// Get top domains for each user (user_threat_domains.user_email is uuid)
-	for _, st := range stats {
-		domainRows, err := s.pool.Query(ctx, `
-			SELECT domain, hit_count
-			FROM user_threat_domains
-			WHERE user_email = $1::uuid AND threat_type = $2
-			ORDER BY hit_count DESC
-			LIMIT 5
-		`, st.UserEmail, category)
-		if err != nil {
-			continue
-		}
-
-		for domainRows.Next() {
-			var domain string
-			var cnt int
-			if domainRows.Scan(&domain, &cnt) == nil {
-				st.Domains = append(st.Domains, domain)
-			}
-		}
-		domainRows.Close()
-	}
-
+	s.cache.Set(cacheKey, stats, CacheTTLMedium)
 	return stats, nil
 }
 
-// GetTopUsersByAllCategories returns top users for all content categories
+// GetTopUsersByAllCategories returns top users for all content categories.
+// Issues a single query that ranks users per category in one pass instead
+// of one round-trip per category, then attaches top-5 domains via LATERAL.
 func (s *Storage) GetTopUsersByAllCategories(ctx context.Context, limit int) (map[string][]*threatintel.CategoryUserStats, error) {
-	categories := []string{"porn", "gambling", "social", "fakenews", "torrent", "tor"}
-	result := make(map[string][]*threatintel.CategoryUserStats)
-
-	for _, cat := range categories {
-		stats, err := s.GetTopUsersByCategory(ctx, cat, limit)
-		if err != nil {
-			return nil, err
-		}
-		result[cat] = stats
+	cacheKey := fmt.Sprintf("top_users_all_categories_%d", limit)
+	if cached, found := s.cache.Get(cacheKey); found {
+		return cached.(map[string][]*threatintel.CategoryUserStats), nil
 	}
 
+	categories := []string{"porn", "gambling", "social", "fakenews", "torrent", "tor"}
+	result := make(map[string][]*threatintel.CategoryUserStats, len(categories))
+	for _, c := range categories {
+		result[c] = nil
+	}
+
+	rows, err := s.pool.Query(ctx, `
+		WITH ranked AS (
+			SELECT user_email, threat_type, match_count,
+			       ROW_NUMBER() OVER (PARTITION BY threat_type ORDER BY match_count DESC) AS rn
+			FROM user_threat_stats
+			WHERE threat_type = ANY($1::text[])
+		)
+		SELECT
+			ranked.user_email::text,
+			ranked.threat_type,
+			ranked.match_count,
+			COALESCE(td.top_domains, '{}'::text[]) AS top_domains
+		FROM ranked
+		LEFT JOIN LATERAL (
+			SELECT array_agg(domain ORDER BY hit_count DESC) AS top_domains
+			FROM (
+				SELECT domain, hit_count
+				FROM user_threat_domains
+				WHERE user_email = ranked.user_email
+				  AND threat_type = ranked.threat_type
+				ORDER BY hit_count DESC
+				LIMIT 5
+			) sub
+		) td ON true
+		WHERE ranked.rn <= $2
+		ORDER BY ranked.threat_type, ranked.match_count DESC
+	`, categories, limit)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+
+	for rows.Next() {
+		var st threatintel.CategoryUserStats
+		var domains []string
+		if err := rows.Scan(&st.UserEmail, &st.Category, &st.MatchCount, &domains); err != nil {
+			return nil, err
+		}
+		st.Domains = domains
+		stats := &st
+		result[st.Category] = append(result[st.Category], stats)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+
+	s.cache.Set(cacheKey, result, CacheTTLMedium)
 	return result, nil
 }
 

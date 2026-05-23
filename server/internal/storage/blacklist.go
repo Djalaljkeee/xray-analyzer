@@ -8,6 +8,7 @@ import (
 	"time"
 
 	"github.com/google/uuid"
+	"github.com/jackc/pgx/v5"
 	"github.com/xray-log-analyzer/server/internal/models"
 )
 
@@ -35,6 +36,52 @@ func (s *Storage) RecordBlacklistMatch(ctx context.Context, match *models.Blackl
 	return err
 }
 
+// BulkRecordBlacklistMatches inserts multiple blacklist matches in a single
+// round-trip. Used by the analyzer to amortize ingestion: a batch of 100
+// log events with 30 blacklist hits drops from 30 INSERTs to 1.
+//
+// All matches MUST share the same NodeID (the analyzer ingests per-batch
+// from one agent). user_email is resolved per row through the in-process
+// cache, which is hit-rate-dominant after the first batch.
+func (s *Storage) BulkRecordBlacklistMatches(ctx context.Context, matches []*models.BlacklistMatch) error {
+	if len(matches) == 0 {
+		return nil
+	}
+	nodeID, err := s.LookupNodeID(ctx, matches[0].NodeID, "exit")
+	if err != nil {
+		return fmt.Errorf("resolve node_id: %w", err)
+	}
+
+	now := time.Now().UTC()
+	rows := make([][]any, 0, len(matches))
+	for _, m := range matches {
+		userUUID, err := s.ResolveUserEmailToUUID(ctx, m.UserEmail)
+		if err != nil {
+			continue
+		}
+		rows = append(rows, []any{
+			int16(nodeID),
+			userUUID,
+			m.SourceIP,
+			m.Destination,
+			m.MatchedRule,
+			m.Timestamp.UTC(),
+			now,
+		})
+	}
+	if len(rows) == 0 {
+		return nil
+	}
+	// COPY FROM is the fastest bulk-insert path in pgx. source_ip is
+	// passed as plain text — Postgres casts text→inet at COPY time.
+	_, err = s.pool.CopyFrom(ctx,
+		pgx.Identifier{"blacklist_matches"},
+		[]string{"node_id", "user_email", "source_ip", "destination", "matched_rule", "timestamp", "ts"},
+		pgx.CopyFromRows(rows),
+	)
+	return err
+}
+
 // GetBlacklistAnalytics returns detailed blacklist analytics for a time period (cached)
 func (s *Storage) GetBlacklistAnalytics(ctx context.Context, since time.Time) (*models.BlacklistAnalytics, error) {
 	// Cache key based on hours since epoch (cache per hour window)
@@ -52,28 +99,17 @@ func (s *Storage) GetBlacklistAnalytics(ctx context.Context, since time.Time) (*
 		HourlyStats:   []models.HourlyBlacklistStats{},
 	}
 
-	// Total hits in period
-	err := s.pool.QueryRow(ctx, `
-		SELECT COUNT(*) FROM blacklist_matches WHERE timestamp > $1
-	`, since.UTC()).Scan(&analytics.TotalHits)
-	if err != nil {
-		return nil, fmt.Errorf("count total hits: %w", err)
-	}
-
-	// Unique users
-	err = s.pool.QueryRow(ctx, `
-		SELECT COUNT(DISTINCT user_email) FROM blacklist_matches WHERE timestamp > $1
-	`, since.UTC()).Scan(&analytics.UniqueUsers)
-	if err != nil {
-		return nil, fmt.Errorf("count unique users: %w", err)
-	}
-
-	// Unique domains
-	err = s.pool.QueryRow(ctx, `
-		SELECT COUNT(DISTINCT destination) FROM blacklist_matches WHERE timestamp > $1
-	`, since.UTC()).Scan(&analytics.UniqueDomains)
-	if err != nil {
-		return nil, fmt.Errorf("count unique domains: %w", err)
+	// All three top-level counters in a single pass over the partition
+	// instead of three separate scans. COUNT(DISTINCT ...) still does the
+	// hash aggregate work, but it walks the rows once.
+	if err := s.pool.QueryRow(ctx, `
+		SELECT
+			COUNT(*),
+			COUNT(DISTINCT user_email),
+			COUNT(DISTINCT destination)
+		FROM blacklist_matches WHERE timestamp > $1
+	`, since.UTC()).Scan(&analytics.TotalHits, &analytics.UniqueUsers, &analytics.UniqueDomains); err != nil {
+		return nil, fmt.Errorf("count blacklist totals: %w", err)
 	}
 
 	// Top domains
@@ -125,20 +161,46 @@ func (s *Storage) loadTopDomains(ctx context.Context, since time.Time, analytics
 }
 
 func (s *Storage) loadTopUsers(ctx context.Context, since time.Time, analytics *models.BlacklistAnalytics) error {
+	// Top users + top-5 domains per user in a single query via LATERAL.
+	// The prior version's STRING_AGG(DISTINCT destination, ', ') over the
+	// full window forced Postgres to materialize and dedupe every domain
+	// per user — O(N) per user, dominated dashboard latency. The LATERAL
+	// subquery walks the (user_email, destination) hash for the top 5
+	// hottest destinations only.
 	rows, err := s.pool.Query(ctx, `
+		WITH agg AS (
+			SELECT
+				bm.user_email,
+				COUNT(*)                              AS hits,
+				COUNT(DISTINCT bm.destination)        AS domains,
+				COALESCE(MAX(bm.source_ip::text), '') AS last_ip
+			FROM blacklist_matches bm
+			WHERE bm.timestamp > $1
+			GROUP BY bm.user_email
+			ORDER BY hits DESC
+			LIMIT 50
+		)
 		SELECT
-			bm.user_email::text,
-			COALESCE(r.username, bm.user_email::text) as display_name,
-			COUNT(*) as hits,
-			COUNT(DISTINCT bm.destination) as domains,
-			STRING_AGG(DISTINCT bm.destination, ', ') as top_domains,
-			COALESCE(MAX(bm.source_ip::text), '') as last_ip
-		FROM blacklist_matches bm
-		LEFT JOIN remna_users r ON r.uuid = bm.user_email
-		WHERE bm.timestamp > $1
-		GROUP BY bm.user_email, r.username
-		ORDER BY hits DESC
-		LIMIT 50
+			agg.user_email::text,
+			COALESCE(r.username, agg.user_email::text) AS display_name,
+			agg.hits,
+			agg.domains,
+			agg.last_ip,
+			COALESCE(td.top_domains, '{}'::text[])     AS top_domains
+		FROM agg
+		LEFT JOIN remna_users r ON r.uuid = agg.user_email
+		LEFT JOIN LATERAL (
+			SELECT array_agg(destination ORDER BY hits DESC) AS top_domains
+			FROM (
+				SELECT destination, COUNT(*) AS hits
+				FROM blacklist_matches
+				WHERE user_email = agg.user_email AND timestamp > $1
+				GROUP BY destination
+				ORDER BY hits DESC
+				LIMIT 5
+			) sub
+		) td ON true
+		ORDER BY agg.hits DESC
 	`, since)
 	if err != nil {
 		return fmt.Errorf("query top users: %w", err)
@@ -147,19 +209,13 @@ func (s *Storage) loadTopUsers(ctx context.Context, since time.Time, analytics *
 
 	for rows.Next() {
 		var u models.UserBlacklistStats
-		var topDomainsStr string
 		var displayName string
-		if err := rows.Scan(&u.UserEmail, &displayName, &u.HitCount, &u.UniqueDomains, &topDomainsStr, &u.LastIP); err != nil {
+		var topDomains []string
+		if err := rows.Scan(&u.UserEmail, &displayName, &u.HitCount, &u.UniqueDomains, &u.LastIP, &topDomains); err != nil {
 			return fmt.Errorf("scan user: %w", err)
 		}
 		u.Username = displayName
-		if topDomainsStr != "" {
-			domains := strings.Split(topDomainsStr, ", ")
-			if len(domains) > 5 {
-				domains = domains[:5]
-			}
-			u.TopDomains = domains
-		}
+		u.TopDomains = topDomains
 		analytics.TopUsers = append(analytics.TopUsers, u)
 	}
 	return rows.Err()

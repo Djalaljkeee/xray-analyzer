@@ -110,6 +110,21 @@ func (a *Analyzer) SetBridgeCorrelation(nodeIDs []string, maxAge time.Duration) 
 	a.bridgeCorrelationWindow = maxAge
 }
 
+// buildUserDestBatch flattens the per-user destination set collected
+// during ProcessBatch into the (user, destination) → count map that
+// storage.BulkRecordUserDestinations expects. The inner sets carry
+// uniqueness per user/destination per batch, so each entry contributes
+// exactly 1 to request_count.
+func buildUserDestBatch(userDestinations map[string]map[string]bool) map[storage.UserDestKey]int {
+	out := make(map[storage.UserDestKey]int, len(userDestinations))
+	for user, dests := range userDestinations {
+		for dest := range dests {
+			out[storage.UserDestKey{UserEmail: user, Destination: dest}]++
+		}
+	}
+	return out
+}
+
 // ProcessBatch processes a batch of log entries
 func (a *Analyzer) ProcessBatch(ctx context.Context, batch *models.LogBatch) (processed int, blacklistHits int, err error) {
 	if batch.NodeID == "" {
@@ -122,6 +137,11 @@ func (a *Analyzer) ProcessBatch(ctx context.Context, batch *models.LogBatch) (pr
 	userLastIP := make(map[string]string)                // user -> last source IP
 	userDestinations := make(map[string]map[string]bool) // user -> set of destinations
 	threatHits := 0
+
+	// Collect blacklist matches for a single bulk-COPY at end of batch.
+	// Earlier code did one INSERT per match; for batches with many hits
+	// that was dominant in pg_stat_statements.
+	var pendingBlacklist []*models.BlacklistMatch
 
 	for _, entry := range batch.Entries {
 		processed++
@@ -150,19 +170,14 @@ func (a *Analyzer) ProcessBatch(ctx context.Context, batch *models.LogBatch) (pr
 			userBlacklist[entry.UserEmail]++
 			userLastDomain[entry.UserEmail] = entry.Destination
 
-			// Record the match
-			match := &models.BlacklistMatch{
+			pendingBlacklist = append(pendingBlacklist, &models.BlacklistMatch{
 				NodeID:      batch.NodeID,
 				UserEmail:   entry.UserEmail,
 				SourceIP:    entry.SourceIP,
 				Destination: entry.Destination,
 				MatchedRule: matchedRule,
 				Timestamp:   entry.Timestamp,
-			}
-			if err := a.storage.RecordBlacklistMatch(ctx, match); err != nil {
-				// log.Printf("analyzer: failed to record blacklist match: %v", err)
-				_ = err // suppress verbose logging
-			}
+			})
 
 			// Check if we need to generate an alert
 			a.checkAndAlert(ctx, batch.NodeID, entry, matchedRule)
@@ -177,6 +192,13 @@ func (a *Analyzer) ProcessBatch(ctx context.Context, batch *models.LogBatch) (pr
 					a.generateThreatAlert(ctx, batch.NodeID, entry, threatMatch)
 				}
 			}
+		}
+	}
+
+	// Flush all blacklist matches collected during the loop in one COPY.
+	if len(pendingBlacklist) > 0 {
+		if err := a.storage.BulkRecordBlacklistMatches(ctx, pendingBlacklist); err != nil {
+			_ = err
 		}
 	}
 
@@ -224,12 +246,14 @@ func (a *Analyzer) ProcessBatch(ctx context.Context, batch *models.LogBatch) (pr
 			a.correlation.ProcessConnection(ctx, user, lastIP, "", "", batch.NodeID)
 		}
 
-		// Record user destinations for detailed tracking
-		for dest := range userDestinations[user] {
-			if err := a.storage.RecordUserDestination(ctx, user, batch.NodeID, dest); err != nil {
-				// log.Printf("analyzer: failed to record user destination: %v", err)
-				_ = err
-			}
+	}
+
+	// Bulk-upsert user destinations: one round-trip for the whole batch
+	// instead of one INSERT per (user, destination) pair (was the second-
+	// largest source of round-trips after blacklist matches).
+	if destBatch := buildUserDestBatch(userDestinations); len(destBatch) > 0 {
+		if err := a.storage.BulkRecordUserDestinations(ctx, batch.NodeID, destBatch); err != nil {
+			_ = err
 		}
 	}
 

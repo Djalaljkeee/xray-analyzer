@@ -98,8 +98,27 @@ func (s *Storage) UpdateNodeStats(ctx context.Context, nodeID string, requests i
 	return err
 }
 
-// UpdateNodeUniqueUsers updates unique users count for a node
+// uniqueUsersRefreshInterval bounds how often UpdateNodeUniqueUsers
+// re-scans user_stats for a node. The underlying COUNT(DISTINCT) was
+// firing on every ingest batch (1-2 Hz per node) and dominated CPU on
+// the read replica — the value drifts slowly enough that 60s is plenty.
+const uniqueUsersRefreshInterval = 60 * time.Second
+
+// UpdateNodeUniqueUsers updates unique users count for a node, but at
+// most once per uniqueUsersRefreshInterval per node. Callers can fire it
+// per-batch; the throttle ensures the COUNT(DISTINCT) only runs at the
+// configured cadence.
 func (s *Storage) UpdateNodeUniqueUsers(ctx context.Context, nodeID string) error {
+	s.uniqueUsersThrottleMu.Lock()
+	last, ok := s.uniqueUsersLastRun[nodeID]
+	now := time.Now()
+	if ok && now.Sub(last) < uniqueUsersRefreshInterval {
+		s.uniqueUsersThrottleMu.Unlock()
+		return nil
+	}
+	s.uniqueUsersLastRun[nodeID] = now
+	s.uniqueUsersThrottleMu.Unlock()
+
 	// user_stats.node_id is smallint FK; resolve text → id first.
 	nid, err := s.LookupNodeID(ctx, nodeID, "exit")
 	if err != nil {
