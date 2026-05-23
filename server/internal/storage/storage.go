@@ -9,6 +9,7 @@ import (
 	"sync"
 	"time"
 
+	"github.com/google/uuid"
 	"github.com/jackc/pgx/v5/pgxpool"
 	"github.com/jackc/pgx/v5/stdlib"
 
@@ -37,6 +38,20 @@ type Storage struct {
 	nodeIDCacheMu sync.RWMutex
 	nodeIDCache   map[string]NodeID
 
+	// uuidCache memoizes ResolveUserEmailToUUID results. Without it, every
+	// per-event write does up to 4 sequential SELECTs against remna_users
+	// to canonicalize the user_email — the single biggest source of CPU on
+	// the ingestion path.
+	uuidCacheMu    sync.RWMutex
+	uuidCache      map[string]uuid.UUID
+	emailIndexSeen sync.Map
+
+	// uniqueUsersThrottleMu guards last-run timestamps for the per-node
+	// COUNT(DISTINCT user_email) refresh; that scan is expensive on
+	// user_stats and was firing on every ingest batch.
+	uniqueUsersThrottleMu sync.Mutex
+	uniqueUsersLastRun    map[string]time.Time
+
 	closeOnce sync.Once
 }
 
@@ -46,8 +61,8 @@ func New(ctx context.Context, dsn string) (*Storage, error) {
 	if err != nil {
 		return nil, fmt.Errorf("parse dsn: %w", err)
 	}
-	cfg.MaxConns = 40
-	cfg.MinConns = 4
+	cfg.MaxConns = 80
+	cfg.MinConns = 8
 	cfg.MaxConnIdleTime = 5 * time.Minute
 	cfg.MaxConnLifetime = 30 * time.Minute
 
@@ -74,10 +89,12 @@ func New(ctx context.Context, dsn string) (*Storage, error) {
 	sqlDB := stdlib.OpenDBFromPool(pool)
 
 	s := &Storage{
-		pool:        pool,
-		db:          sqlDB,
-		cache:       cache.New(),
-		nodeIDCache: make(map[string]NodeID),
+		pool:               pool,
+		db:                 sqlDB,
+		cache:              cache.New(),
+		nodeIDCache:        make(map[string]NodeID),
+		uuidCache:          make(map[string]uuid.UUID, 1024),
+		uniqueUsersLastRun: make(map[string]time.Time),
 	}
 	if err := s.migrate(ctx); err != nil {
 		s.Close()
@@ -137,7 +154,11 @@ func (s *Storage) SetNodeRemnaMap(m map[string]string) {
 
 // WarmCache pre-populates the in-process L1 cache by firing all heavy read
 // queries in parallel. Called once at startup and after each Remnawave sync.
+// Also resets the UUID-resolution cache so a fresh sync's newly inserted
+// remna_users rows are picked up instead of being shadowed by stale SHA-1
+// fallbacks created before they were known.
 func (s *Storage) WarmCache(ctx context.Context) {
+	s.resetUUIDCache()
 	log.Println("[cache] warming cache in parallel...")
 	start := time.Now()
 

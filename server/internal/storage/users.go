@@ -280,9 +280,6 @@ func (s *Storage) GetUserDetails(ctx context.Context, userEmail string) (*models
 	// Build list of possible identifiers to search for
 	searchIDs := buildUserSearchIDs(userEmail)
 
-	// Debug log
-	fmt.Printf("[DEBUG] GetUserDetails: email=%s, searchIDs=%v\n", userEmail, searchIDs)
-
 	// Try to find user in remna_users
 	var remnaUserExists bool
 	var remnaUUID, username, status string
@@ -295,73 +292,32 @@ func (s *Storage) GetUserDetails(ctx context.Context, userEmail string) (*models
 	var description string
 	var usID sql.NullString
 
-	// Check if userEmail is a numeric ID
-	if numericID, err := strconv.ParseInt(userEmail, 10, 64); err == nil {
-		row := s.db.QueryRowContext(ctx, `
-			SELECT uuid, COALESCE(id, 0), username, status,
-				   COALESCE(used_traffic_bytes, 0),
-				   COALESCE(traffic_limit_bytes, 0),
-				   COALESCE(hwid_device_count, 0),
-				   hwid_device_limit,
-				   online_at,
-				   expire_at,
-				   telegram_id,
-				   COALESCE(description, ''),
-				   us_id
-			FROM remna_users WHERE id = $1
-		`, numericID)
-
-		err := row.Scan(&remnaUUID, &remnaID, &username, &status, &usedTraffic, &trafficLimit,
-			&hwidCount, &hwidLimit, &onlineAt, &expireAt, &telegramID, &description, &usID)
-		if err == nil {
-			remnaUserExists = true
-		}
+	// Single round-trip lookup: matches by id (if numeric), us_id, or
+	// username — in that priority order so explicit IDs win when present.
+	var numericID int64
+	if n, err := strconv.ParseInt(userEmail, 10, 64); err == nil {
+		numericID = n
 	}
+	row := s.db.QueryRowContext(ctx, `
+		SELECT uuid, COALESCE(id, 0), username, status,
+			   COALESCE(used_traffic_bytes, 0),
+			   COALESCE(traffic_limit_bytes, 0),
+			   COALESCE(hwid_device_count, 0),
+			   hwid_device_limit,
+			   online_at,
+			   expire_at,
+			   telegram_id,
+			   COALESCE(description, ''),
+			   us_id
+		FROM remna_users
+		WHERE ($1 > 0 AND id = $1) OR us_id = $2 OR username = $2
+		ORDER BY (id = $1) DESC, (us_id = $2) DESC
+		LIMIT 1
+	`, numericID, userEmail)
 
-	// If not found by ID, try by us_id
-	if !remnaUserExists {
-		row := s.db.QueryRowContext(ctx, `
-			SELECT uuid, COALESCE(id, 0), username, status,
-				   COALESCE(used_traffic_bytes, 0),
-				   COALESCE(traffic_limit_bytes, 0),
-				   COALESCE(hwid_device_count, 0),
-				   hwid_device_limit,
-				   online_at,
-				   expire_at,
-				   telegram_id,
-				   COALESCE(description, ''),
-				   us_id
-			FROM remna_users WHERE us_id = $1
-		`, userEmail)
-
-		err := row.Scan(&remnaUUID, &remnaID, &username, &status, &usedTraffic, &trafficLimit,
-			&hwidCount, &hwidLimit, &onlineAt, &expireAt, &telegramID, &description, &usID)
-		if err == nil {
-			remnaUserExists = true
-		}
-	}
-
-	// If not found by us_id, try by username
-	if !remnaUserExists {
-		row := s.db.QueryRowContext(ctx, `
-			SELECT uuid, COALESCE(id, 0), username, status,
-				   COALESCE(used_traffic_bytes, 0),
-				   COALESCE(traffic_limit_bytes, 0),
-				   COALESCE(hwid_device_count, 0),
-				   hwid_device_limit,
-				   online_at,
-				   expire_at,
-				   telegram_id,
-				   COALESCE(description, ''),
-				   us_id
-			FROM remna_users WHERE username = $1
-		`, userEmail)
-
-		err := row.Scan(&remnaUUID, &remnaID, &username, &status, &usedTraffic, &trafficLimit,
-			&hwidCount, &hwidLimit, &onlineAt, &expireAt, &telegramID, &description, &usID)
-		if err == nil {
-			remnaUserExists = true
-		}
+	if err := row.Scan(&remnaUUID, &remnaID, &username, &status, &usedTraffic, &trafficLimit,
+		&hwidCount, &hwidLimit, &onlineAt, &expireAt, &telegramID, &description, &usID); err == nil {
+		remnaUserExists = true
 	}
 
 	// If found user, add their Remnawave ID to search IDs for stats lookup
@@ -376,7 +332,6 @@ func (s *Storage) GetUserDetails(ctx context.Context, userEmail string) (*models
 		}
 		if !found {
 			searchIDs = append(searchIDs, remnaIDStr)
-			fmt.Printf("[DEBUG] GetUserDetails: added remnaID=%s to searchIDs, now=%v\n", remnaIDStr, searchIDs)
 		}
 	}
 
@@ -391,7 +346,6 @@ func (s *Storage) GetUserDetails(ctx context.Context, userEmail string) (*models
 		}
 		if !found {
 			searchIDs = append(searchIDs, usID.String)
-			fmt.Printf("[DEBUG] GetUserDetails: added us_id=%s to searchIDs, now=%v\n", usID.String, searchIDs)
 		}
 	}
 

@@ -179,6 +179,14 @@ func main() {
 				} else if deleted > 0 {
 					log.Printf("cleanup: deleted %d old threat matches", deleted)
 				}
+				// Trim per-user/category recent matches to cap. Moved out
+				// of SaveThreatMatch hot path — previously fired on every
+				// match insert and scanned an unbounded subquery.
+				if deleted, err := store.TrimThreatMatchesPerUserCategory(ctx); err != nil {
+					log.Printf("trim threat matches error: %v", err)
+				} else if deleted > 0 {
+					log.Printf("cleanup: trimmed %d excess per-user-category matches", deleted)
+				}
 				// Cleanup analyzer alert cache
 				anal.CleanupAlertCache()
 			}

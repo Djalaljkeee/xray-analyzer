@@ -19,16 +19,30 @@ func (item Item) IsExpired() bool {
 	return time.Now().UnixNano() > item.Expiration
 }
 
+// flight tracks an in-flight GetOrSet computation for a single key so
+// concurrent callers share the same DB round-trip instead of each firing
+// their own (singleflight pattern). Without this, every cache miss under
+// load triggers a thundering herd against PostgreSQL.
+type flight struct {
+	done chan struct{}
+	val  interface{}
+	err  error
+}
+
 // Cache is a simple in-memory cache with TTL support
 type Cache struct {
 	items map[string]Item
 	mu    sync.RWMutex
+
+	flightMu sync.Mutex
+	flights  map[string]*flight
 }
 
 // New creates a new cache instance
 func New() *Cache {
 	c := &Cache{
-		items: make(map[string]Item),
+		items:   make(map[string]Item),
+		flights: make(map[string]*flight),
 	}
 	// Start cleanup goroutine
 	go c.cleanup()
@@ -109,22 +123,34 @@ func (c *Cache) cleanup() {
 	}
 }
 
-// GetOrSet returns cached value or calls fn to get and cache a new value
+// GetOrSet returns cached value or calls fn to get and cache a new value.
+// Concurrent callers for the same key share a single fn execution.
 func (c *Cache) GetOrSet(key string, ttl time.Duration, fn func() (interface{}, error)) (interface{}, error) {
-	// Try to get from cache first
 	if value, found := c.Get(key); found {
 		return value, nil
 	}
 
-	// Call the function to get the value
-	value, err := fn()
-	if err != nil {
-		return nil, err
+	c.flightMu.Lock()
+	if f, ok := c.flights[key]; ok {
+		c.flightMu.Unlock()
+		<-f.done
+		return f.val, f.err
+	}
+	f := &flight{done: make(chan struct{})}
+	c.flights[key] = f
+	c.flightMu.Unlock()
+
+	f.val, f.err = fn()
+	if f.err == nil {
+		c.Set(key, f.val, ttl)
 	}
 
-	// Cache the value
-	c.Set(key, value, ttl)
-	return value, nil
+	c.flightMu.Lock()
+	delete(c.flights, key)
+	c.flightMu.Unlock()
+	close(f.done)
+
+	return f.val, f.err
 }
 
 // Stats returns cache statistics
