@@ -3,10 +3,17 @@ package storage
 import (
 	"context"
 	"fmt"
+	"regexp"
 	"sync"
 
 	"github.com/google/uuid"
 )
+
+// usEmailPattern matches Xray "email" identifiers of the form "us_<digits>"
+// (case-insensitive). Must stay in sync with usIDPattern in
+// remnawave/note_parser.go — only the digit suffix is ever stored in
+// remna_users.us_id, never the "us_" prefix.
+var usEmailPattern = regexp.MustCompile(`^(?i)us_(\d+)$`)
 
 // uuidResolveCacheCap bounds the in-memory map of email→uuid resolutions.
 // Each entry is ~80 bytes, so 100k entries ≈ 8MB. When the cap is reached
@@ -58,6 +65,22 @@ func (s *Storage) ResolveUserEmailToUUID(ctx context.Context, email string) (uui
 	if id, err := uuid.Parse(email); err == nil {
 		s.cacheResolvedUUID(email, id)
 		return id, nil
+	}
+
+	// Step 1b: "us_<digits>" form. isNumericString below returns false for
+	// the prefixed form, so without this branch we'd take the text path
+	// (which only checks username/email) and miss the us_id index entirely,
+	// silently writing a SHA-1 fallback UUID for a user that does exist in
+	// Remnawave. Route the bare digits through the same numeric query.
+	if m := usEmailPattern.FindStringSubmatch(email); m != nil {
+		var idStr string
+		if err := s.pool.QueryRow(ctx, resolveUserEmailQueryNumeric, m[1]).Scan(&idStr); err == nil && idStr != "" {
+			if id, perr := uuid.Parse(idStr); perr == nil {
+				s.cacheResolvedUUID(email, id)
+				return id, nil
+			}
+		}
+		// fall through to existing text-then-SHA-1 path
 	}
 
 	// Step 2: single-query lookup in remna_users. UNION ALL with LIMIT 1 lets
@@ -138,10 +161,10 @@ func (s *Storage) registerEmailIndexOnce(ctx context.Context, id uuid.UUID, emai
 	s.emailIndexSeen.Store(id, struct{}{})
 }
 
-// resetUUIDCache clears all memoized resolutions. Called from cache
+// ResetUUIDCache clears all memoized resolutions. Called from cache
 // invalidation paths so newly-synced Remnawave users are picked up
 // immediately instead of being shadowed by stale SHA-1 fallbacks.
-func (s *Storage) resetUUIDCache() {
+func (s *Storage) ResetUUIDCache() {
 	s.uuidCacheMu.Lock()
 	s.uuidCache = make(map[string]uuid.UUID, 1024)
 	s.uuidCacheMu.Unlock()

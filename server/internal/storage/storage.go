@@ -158,7 +158,7 @@ func (s *Storage) SetNodeRemnaMap(m map[string]string) {
 // remna_users rows are picked up instead of being shadowed by stale SHA-1
 // fallbacks created before they were known.
 func (s *Storage) WarmCache(ctx context.Context) {
-	s.resetUUIDCache()
+	s.ResetUUIDCache()
 	log.Println("[cache] warming cache in parallel...")
 	start := time.Now()
 
